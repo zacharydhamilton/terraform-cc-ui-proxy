@@ -81,7 +81,7 @@ resource "aws_instance" "ui_proxy" {
     associate_public_ip_address = true
     instance_type = data.aws_ec2_instance_type.ui_proxy.instance_type
     subnet_id = var.subnet_id
-    vpc_security_group_ids = [ "${aws_security_group.ui_proxy.id}" ]
+    vpc_security_group_ids = [ "${var.create_security_group ? aws_security_group.ui_proxy[0].id : var.security_group_id}" ]
     user_data = data.cloudinit_config.nginx.rendered
     tags = {
         Name = "${var.naming_prefix}ui-proxy-instance"
@@ -96,18 +96,21 @@ resource "aws_eip" "ui_proxy" {
 }
 # Capture the current public ip of the machine running this
 data "http" "myip" {
+    count = var.whitelist_current_ip ? 1 : 0
     url = "http://ipv4.icanhazip.com"
 }
 # Gather all the service ips from aws
 data "http" "ec2_instance_connect" {
+    count = var.whitelist_ec2_instance_connect ? 1 : 0
     url = "https://ip-ranges.amazonaws.com/ip-ranges.json"
 }
 # Specifically get the ec2 instance connect service ip so it can be whitelisted
 locals {
-    ec2_instance_connect_ip = [ for e in jsondecode(data.http.ec2_instance_connect.response_body)["prefixes"] : e.ip_prefix if e.region == "${var.aws_region}" && e.service == "EC2_INSTANCE_CONNECT" ]
+    ec2_instance_connect_ip = [ for e in jsondecode(data.http.ec2_instance_connect[0].response_body)["prefixes"] : e.ip_prefix if e.region == "${var.aws_region}" && e.service == "EC2_INSTANCE_CONNECT" ]
 }
 // Security group to configure access to a restricted set of IPs
 resource "aws_security_group" "ui_proxy" {
+    count = var.create_security_group ? 1 : 0
     vpc_id = var.vpc_id
     name = "${var.naming_prefix}ui-proxy-instance-sg"
     egress {
@@ -117,34 +120,48 @@ resource "aws_security_group" "ui_proxy" {
         protocol = -1
         cidr_blocks = [ "0.0.0.0/0" ]
     }
-    ingress {
-        description = "SSH"
-        from_port = 22
-        to_port = 22 
-        protocol = "tcp" 
-        cidr_blocks = [ "${local.ec2_instance_connect_ip[0]}", "${chomp(data.http.myip.response_body)}/32" ]
-    }
-    ingress {
-        description = "HTTPS"
-        from_port = 443
-        to_port = 443 
-        protocol = "tcp" 
-        cidr_blocks = [ "${chomp(data.http.myip.response_body)}/32" ]
-    }
     tags = {
         Name = "${var.naming_prefix}ui-proxy-instance-sg"
     }
 }
+resource "aws_security_group_rule" "my_current_ip_ssh" {
+    count = var.whitelist_current_ip ? 1 : 0
+    type = "ingress"
+    from_port = 0
+    to_port = 22
+    protocol = "TCP"
+    cidr_blocks = [ "${chomp(data.http.myip[0].response_body)}/32" ]
+    security_group_id = var.create_security_group ? aws_security_group.ui_proxy[0].id : var.security_group_id
+}
+resource "aws_security_group_rule" "my_current_ip_https" {
+    count = var.whitelist_current_ip ? 1 : 0
+    type = "ingress"
+    from_port = 0
+    to_port = 443
+    protocol = "TCP"
+    cidr_blocks = [ "${chomp(data.http.myip[0].response_body)}/32" ]
+    security_group_id = var.create_security_group ? aws_security_group.ui_proxy[0].id : var.security_group_id
+}
+resource "aws_security_group_rule" "ec2_instance_connect_ssh" {
+    count = var.whitelist_ec2_instance_connect ? 1 : 0
+    type = "ingress"
+    from_port = 0
+    to_port = 22
+    protocol = "TCP"
+    cidr_blocks = [ "${local.ec2_instance_connect_ip[0]}" ]
+    security_group_id = var.create_security_group ? aws_security_group.ui_proxy[0].id : var.security_group_id
+}
+
 // Route to target the TGW when IPs resolve to CC
 resource "aws_route" "proxy-tgw" {
-    count = var.tgw_id != null ? 1 : 0
+    count = var.use_tgw && var.create_routes ? 1 : 0
     route_table_id = var.route_table_id
     destination_cidr_block = var.ccn_cidr
     transit_gateway_id = var.tgw_id
 }
 // Route to target the peering connection when IPs resolve to CC
 resource "aws_route" "proxy-peering" {
-    count = var.peering_connection_id != null ? 1 : 0
+    count = var.use_peering && var.create_routes ? 1 : 0
     route_table_id = var.route_table_id
     destination_cidr_block = var.ccn_cidr
     vpc_peering_connection_id = var.peering_connection_id
